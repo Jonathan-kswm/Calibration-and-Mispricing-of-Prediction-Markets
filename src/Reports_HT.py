@@ -71,4 +71,9 @@ class Report:
                 results.append(dataframe['result'][idx])
             else:
                 continue
-        return sum(results) / len(markets)
+        return len(markets), sum(results), (sum(results) / len(markets))
+
+    def report_table(self,metric , step, margin = 0.05):
+        #check that the metric is ok
+        valid_metrics = ("count", "")
+

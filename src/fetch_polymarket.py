@@ -440,6 +440,7 @@ def write_csv(rows):
 
 
 def main():
+    start_time = datetime.timestamp(datetime.now())
     os.makedirs(CACHE_DIR, exist_ok=True)
     os.makedirs(PAYOUT_CACHE_DIR, exist_ok=True)
     os.makedirs(_DATA_DIR, exist_ok=True)
@@ -476,9 +477,10 @@ def main():
             if row["outcome"] is None:
                 n_unresolved += 1  # kept but flagged (blank outcome)
         # Heartbeat every 10 markets so a slow (uncached) stretch doesn't look
-        # frozen; checkpoint the CSV every FLUSH_EVERY markets.
+        # frozen; checkpoint the CSV every FLUSH_EVERY market.
         if i % 10 == 0:
-            print(f"  processed {i} markets (kept {len(rows)} rows)")
+            time = datetime.timestamp(datetime.now())
+            print(f"processed {i} markets (kept {len(rows)} rows) | Uptime: {time - start_time} ({datetime.now()})")
         if i % FLUSH_EVERY == 0:
             write_csv(rows)  # checkpoint to disk
 
