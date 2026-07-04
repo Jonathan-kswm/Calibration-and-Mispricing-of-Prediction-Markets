@@ -6,15 +6,19 @@ Prices come from public Polymarket HTTP APIs (no auth):
   - Gamma  (market list + metadata): https://gamma-api.polymarket.com/markets
   - CLOB   (per-token price series):  https://clob.polymarket.com/prices-history
 
-The realized winner is NOT inferred from prices. It is read from the on-chain
-Conditional Tokens Framework (CTF) payout vector on Polygon, keyed by the
-market's conditionId, via web3.py.
+The realized winner comes from Gamma's settled `outcomePrices` (already in the
+market-list response, so it costs nothing): ["1","0"] => Yes, ["0","1"] => No,
+within GAMMA_SETTLE_TOL. Only when that vector is ambiguous do we fall back to
+the authoritative on-chain Conditional Tokens Framework (CTF) payout vector on
+Polygon, keyed by the market's conditionId, via web3.py.
 """
 
 import argparse
 import json
 import os
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -49,15 +53,19 @@ CTF_ABI = [
 
 MAX_MARKETS = 1000      # cap kept binary markets for a test run; set None for full pull
 FLUSH_EVERY = 25      # checkpoint the CSV to disk every N processed markets
-DERIVE_NO = False     # if True, fetch only the Yes token and set No = 1 - Yes
-PAGE_LIMIT = 500      # requested page size; Gamma caps actual pages at ~100
+DERIVE_NO = True      # if True, fetch only the Yes token and set No = 1 - Yes
+WORKERS = 6           # parallel per-market workers; total CLOB rate ~= WORKERS /
+                      # (REQUEST_SLEEP + latency). Back off if 429s dominate.
+PAGE_LIMIT = 500      # requested page size; Gamma usually caps pages at ~100
                       # (offset advances by rows returned, so this only affects
                       #  how many markets each request asks for, not coverage)
 FIDELITY = 60         # fine price-history resolution (minutes); good for short markets
 FIDELITY_DAILY = 1440 # coarse fallback (1 day); hourly returns empty for long markets
 LONG_MARKET_DAYS = 14 # markets longer than this try daily fidelity first
-REQUEST_SLEEP = 0.8   # seconds between CLOB calls (~60/min undocumented read limit)
+REQUEST_SLEEP = 0.8   # seconds between HTTP calls *per thread* (429 backoff in
+                      # get_json self-corrects if the combined rate is too hot)
 RPC_SLEEP = 0.8       # seconds between on-chain calls (be polite to public RPCs)
+GAMMA_SETTLE_TOL = 1e-3  # outcomePrices this close to a unit vector counts as settled
 TIMEOUT = 25          # per-request timeout (seconds)
 MAX_RETRIES = 5       # retries on network error / HTTP 429
 
@@ -123,8 +131,45 @@ def get_json(url, params):
 
 
 # --------------------------------------------------------------------------- #
-# On-chain winner from CTF payout vector
+# Winner: Gamma settled outcomePrices, on-chain CTF payout vector as fallback
 # --------------------------------------------------------------------------- #
+def winner_from_gamma(outcome_prices):
+    """Winner from Gamma's `outcomePrices` field (stringified JSON pair).
+
+      1    -> Yes won   (prices ~ ["1","0"])
+      0    -> No won    (prices ~ ["0","1"])
+      None -> ambiguous -> caller must fall back to the on-chain payout vector
+
+    CLOB-era markets settle to exactly ["1","0"]/["0","1"], but pre-2023
+    AMM-era markets settle to the final pool price, which carries dust (e.g.
+    0.9999994 / 0.0000006) — hence GAMMA_SETTLE_TOL instead of exact equality.
+    A mislabel would need the LOSING side priced >= 1-tol after resolution,
+    i.e. 999:1 free money nobody arbitraged; anything genuinely ambiguous
+    (voided, split, mid-dispute) stays None and gets the authoritative check.
+    """
+    try:
+        vals = outcome_prices if isinstance(outcome_prices, list) \
+            else json.loads(outcome_prices or "[]")
+        p = [float(x) for x in vals]
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if len(p) != 2:
+        return None
+    if p[0] >= 1 - GAMMA_SETTLE_TOL and p[1] <= GAMMA_SETTLE_TOL:
+        return 1  # Yes
+    if p[1] >= 1 - GAMMA_SETTLE_TOL and p[0] <= GAMMA_SETTLE_TOL:
+        return 0  # No
+    return None
+
+
+# Outcome labeling is the ground truth of the whole dataset; fail loudly at
+# startup if the parse ever breaks.
+assert winner_from_gamma('["1", "0"]') == 1
+assert winner_from_gamma('["0.9999994", "0.0000006"]') == 1
+assert winner_from_gamma('["0", "1"]') == 0
+assert winner_from_gamma('["0.5", "0.5"]') is None
+assert winner_from_gamma(None) is None and winner_from_gamma("junk") is None
+
 _ctf_contract = None  # lazily-initialised, falls back across POLYGON_RPCS
 
 
@@ -244,6 +289,7 @@ def _emit_market(m, stats):
         "end_date": m.get("endDate"),
         "start_date": m.get("startDate"),  # used to pick price-history fidelity
         "category": m.get("category"),
+        "outcome_prices": m.get("outcomePrices"),  # settled result, free winner lookup
     }
 
 
@@ -428,8 +474,12 @@ def build_row(market, t0):
         order = [h[0] for h in HORIZONS]
         missing = sorted(set(yes_missing) | set(no_missing), key=order.index)
 
-    # Realized winner from the on-chain CTF payout vector (None => unresolved/voided).
-    outcome = get_winner(market["condition_id"])
+    # Realized winner: Gamma's settled outcomePrices (free, already fetched)
+    # first; on-chain CTF payout vector only when Gamma is ambiguous. This
+    # removes the 3 Polygon RPC calls per market that dominated run time.
+    outcome = winner_from_gamma(market["outcome_prices"])
+    if outcome is None:
+        outcome = get_winner(market["condition_id"])
 
     row = {
         "question": market["question"],
@@ -491,9 +541,12 @@ def main(name=None):
     n_unresolved = 0
     skipped_empty = 0
     skipped_error = 0
-    # Process and checkpoint as markets stream in, so the CSV is written
-    # incrementally and a long full pull (or an interrupted run) still produces
-    # output instead of only writing once at the very end.
+    # Markets stream from the enumerator (main thread, Gamma) into a small
+    # thread pool that does the per-market work (CLOB history + winner), since
+    # per-call latency + polite sleeps, not bandwidth, dominate run time. Rows
+    # are collected and checkpointed in enumeration order by draining the FIFO
+    # from the front; blocking on the oldest future is the backpressure that
+    # keeps at most ~2 batches in flight.
     #
     # tqdm total: MAX_MARKETS is an *exact* total when set (the generator returns
     # after yielding exactly that many kept markets), giving a determinate % + ETA
@@ -501,35 +554,53 @@ def main(name=None):
     # to an indeterminate counter (count + elapsed + rate, no % / ETA).
     bar = tqdm(iter_resolved_markets(stats), total=MAX_MARKETS,
                unit="market", desc="Processing markets")
-    for i, market in enumerate(bar, 1):
-        # Isolate per-market failures: a transient RPC/HTTP error or an unexpected
-        # response on a single market must not crash the whole multi-hour run.
-        try:
-            t0 = resolve_t0(market)
-            if t0 is None:
-                skipped_empty += 1
-                continue
-            row, all_present = build_row(market, t0)
-        except Exception as exc:
-            skipped_error += 1
-            tqdm.write(f"  ! skipped {market.get('condition_id')}: {type(exc).__name__}: {exc}")
-            continue
-        if row is None:
-            skipped_empty += 1
-        else:
-            rows.append(row)
-            if all_present:
-                n_all_horizons += 1
-            if row["outcome"] is None:
-                n_unresolved += 1  # kept but flagged (blank outcome)
-        # Surface live counts on the bar (elapsed time + rate are shown by tqdm
-        # itself); refresh every 10 markets to keep overhead negligible.
-        if i % 10 == 0:
-            bar.set_postfix(kept=len(rows),
-                            skipped=skipped_empty + skipped_error,
-                            refresh=False)
-        if i % FLUSH_EVERY == 0:
-            write_csv(rows, out_csv)  # checkpoint to disk
+    done = 0
+    pending = deque()  # (future, market) in enumeration order
+
+    def process(market):
+        """Worker: full per-market pipeline. Returns (row_or_None, all_present)."""
+        t0 = resolve_t0(market)
+        if t0 is None:
+            return None, False
+        return build_row(market, t0)
+
+    def drain(down_to):
+        """Consume completed futures from the front of `pending` until at most
+        `down_to` remain, updating counters and checkpointing. Isolates
+        per-market failures: one bad market must not kill a multi-hour run."""
+        nonlocal done, n_all_horizons, n_unresolved, skipped_empty, skipped_error
+        while len(pending) > down_to:
+            future, market = pending.popleft()
+            done += 1
+            try:
+                row, all_present = future.result()
+            except Exception as exc:
+                skipped_error += 1
+                tqdm.write(f"  ! skipped {market.get('condition_id')}: "
+                           f"{type(exc).__name__}: {exc}")
+            else:
+                if row is None:
+                    skipped_empty += 1
+                else:
+                    rows.append(row)
+                    if all_present:
+                        n_all_horizons += 1
+                    if row["outcome"] is None:
+                        n_unresolved += 1  # kept but flagged (blank outcome)
+            # Surface live counts on the bar (elapsed time + rate are shown by
+            # tqdm itself); refresh every 10 markets to keep overhead negligible.
+            if done % 10 == 0:
+                bar.set_postfix(kept=len(rows),
+                                skipped=skipped_empty + skipped_error,
+                                refresh=False)
+            if done % FLUSH_EVERY == 0:
+                write_csv(rows, out_csv)  # checkpoint to disk
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for market in bar:
+            pending.append((pool.submit(process, market), market))
+            drain(WORKERS * 2)
+        drain(0)
 
     bar.close()
     write_csv(rows, out_csv)  # final flush
