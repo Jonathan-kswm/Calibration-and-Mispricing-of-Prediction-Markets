@@ -11,6 +11,7 @@ Conditional Tokens Framework (CTF) payout vector on Polygon, keyed by the
 market's conditionId, via web3.py.
 """
 
+import argparse
 import json
 import os
 import time
@@ -18,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import requests
+from tqdm import tqdm
 from web3 import Web3
 
 # --------------------------------------------------------------------------- #
@@ -45,7 +47,7 @@ CTF_ABI = [
      "outputs": [{"name": "", "type": "uint256"}]},
 ]
 
-MAX_MARKETS = None      # cap kept binary markets for a test run; set None for full pull
+MAX_MARKETS = 1000      # cap kept binary markets for a test run; set None for full pull
 FLUSH_EVERY = 25      # checkpoint the CSV to disk every N processed markets
 DERIVE_NO = False     # if True, fetch only the Yes token and set No = 1 - Yes
 PAGE_LIMIT = 500      # requested page size; Gamma caps actual pages at ~100
@@ -128,7 +130,7 @@ def _get_ctf_contract():
             w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": TIMEOUT}))
             if w3.is_connected():
                 _ctf_contract = w3.eth.contract(address=addr, abi=CTF_ABI)
-                print(f"Connected to Polygon RPC: {rpc}")
+                tqdm.write(f"Connected to Polygon RPC: {rpc}")
                 return _ctf_contract
         except Exception:
             continue
@@ -281,8 +283,8 @@ def iter_resolved_markets(stats):
             offset += len(page)  # Gamma returns ~100/page regardless of limit
             if offset >= OFFSET_CAP:
                 break  # approaching the offset cap => slide the window instead
-        print(f"  ...scanned {stats['scanned']} markets, kept {stats['kept']} "
-              f"binary (window end_date_max={window_max})")
+        tqdm.write(f"  ...scanned {stats['scanned']} markets, kept {stats['kept']} "
+                   f"binary (window end_date_max={window_max})")
         # Stop when a whole window produced nothing new (end of history, or all
         # remaining markets share one endDate boundary we can't page past).
         if oldest_end is None or new_this_window == 0:
@@ -430,20 +432,41 @@ def build_row(market, t0):
     return row, (len(missing) == 0)
 
 
-def write_csv(rows):
-    """Write all accumulated rows to OUT_CSV atomically (temp file + os.replace),
-    so an interrupt mid-write can never leave a half-written/corrupt CSV."""
+def unique_path(path):
+    """Return `path` if free, else the first `base(n).ext` that doesn't exist,
+    so an existing file is never overwritten (browser-style numbering)."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    n = 1
+    while os.path.exists(f"{base}({n}){ext}"):
+        n += 1
+    return f"{base}({n}){ext}"
+
+
+def write_csv(rows, out_path):
+    """Write all accumulated rows to `out_path` atomically (temp file +
+    os.replace), so an interrupt mid-write can never leave a half-written/corrupt
+    CSV."""
     df = pd.DataFrame(rows, columns=COLUMNS)
-    tmp = OUT_CSV + ".tmp"
+    tmp = out_path + ".tmp"
     df.to_csv(tmp, index=False)
-    os.replace(tmp, OUT_CSV)
+    os.replace(tmp, out_path)
 
 
-def main():
-    start_time = datetime.timestamp(datetime.now())
+def main(name=None):
+    start_time = time.monotonic()
     os.makedirs(CACHE_DIR, exist_ok=True)
     os.makedirs(PAYOUT_CACHE_DIR, exist_ok=True)
     os.makedirs(_DATA_DIR, exist_ok=True)
+
+    # Pick a non-overwriting output name once, up front, and reuse it for every
+    # checkpoint + the final flush. Resolving it per write would scatter one run
+    # across <name>.csv, <name>(1).csv, ... as each checkpoint sees the previous
+    # file already there. A custom --name lands in Data/ and gets the same
+    # numbering treatment as the default.
+    base_csv = OUT_CSV if name is None else os.path.join(_DATA_DIR, f"{name}.csv")
+    out_csv = unique_path(base_csv)
 
     print("Streaming resolved binary markets from Gamma...")
     stats = {"scanned": 0, "kept": 0}
@@ -455,7 +478,14 @@ def main():
     # Process and checkpoint as markets stream in, so the CSV is written
     # incrementally and a long full pull (or an interrupted run) still produces
     # output instead of only writing once at the very end.
-    for i, market in enumerate(iter_resolved_markets(stats), 1):
+    #
+    # tqdm total: MAX_MARKETS is an *exact* total when set (the generator returns
+    # after yielding exactly that many kept markets), giving a determinate % + ETA
+    # bar. When None (full pull) the total is unknown up front, so tqdm falls back
+    # to an indeterminate counter (count + elapsed + rate, no % / ETA).
+    bar = tqdm(iter_resolved_markets(stats), total=MAX_MARKETS,
+               unit="market", desc="Processing markets")
+    for i, market in enumerate(bar, 1):
         # Isolate per-market failures: a transient RPC/HTTP error or an unexpected
         # response on a single market must not crash the whole multi-hour run.
         try:
@@ -466,7 +496,7 @@ def main():
             row, all_present = build_row(market, t0)
         except Exception as exc:
             skipped_error += 1
-            print(f"  ! skipped {market.get('condition_id')}: {type(exc).__name__}: {exc}")
+            tqdm.write(f"  ! skipped {market.get('condition_id')}: {type(exc).__name__}: {exc}")
             continue
         if row is None:
             skipped_empty += 1
@@ -476,25 +506,77 @@ def main():
                 n_all_horizons += 1
             if row["outcome"] is None:
                 n_unresolved += 1  # kept but flagged (blank outcome)
-        # Heartbeat every 10 markets so a slow (uncached) stretch doesn't look
-        # frozen; checkpoint the CSV every FLUSH_EVERY market.
+        # Surface live counts on the bar (elapsed time + rate are shown by tqdm
+        # itself); refresh every 10 markets to keep overhead negligible.
         if i % 10 == 0:
-            time = datetime.timestamp(datetime.now())
-            print(f"processed {i} markets (kept {len(rows)} rows) | Uptime: {time - start_time} ({datetime.now()})")
+            bar.set_postfix(kept=len(rows),
+                            skipped=skipped_empty + skipped_error,
+                            refresh=False)
         if i % FLUSH_EVERY == 0:
-            write_csv(rows)  # checkpoint to disk
+            write_csv(rows, out_csv)  # checkpoint to disk
 
-    write_csv(rows)  # final flush
+    bar.close()
+    write_csv(rows, out_csv)  # final flush
 
+    elapsed = timedelta(seconds=time.monotonic() - start_time)
     print("\n=== Summary ===")
     print(f"Total resolved scanned    : {stats['scanned']}")
     print(f"Binary kept               : {stats['kept']}")
-    print(f"Rows written              : {len(rows)} -> {os.path.relpath(OUT_CSV)}")
+    print(f"Rows written              : {len(rows)} -> {os.path.relpath(out_csv)}")
     print(f"Markets w/ all 6 horizons : {n_all_horizons}")
     print(f"Unresolved/voided (flagged, blank outcome): {n_unresolved}")
     print(f"Skipped (no usable history/time)         : {skipped_empty}")
     print(f"Skipped (errors)                         : {skipped_error}")
+    print(f"Total run time                           : {elapsed}")
+
+
+def _max_markets_arg(s):
+    """argparse type: an int cap, or None for a full pull ('all'/'none'/'0')."""
+    if s.lower() in ("all", "none", "0"):
+        return None
+    try:
+        n = int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"max_markets must be a non-negative integer or 'all', got {s!r}")
+    if n < 0:
+        raise argparse.ArgumentTypeError("max_markets must be >= 0")
+    return n
+
+
+def _name_arg(s):
+    """argparse type for --name: a bare output filename placed in Data/. Strips
+    any directory part and a trailing extension, and rejects empty names or names
+    containing characters illegal in a Windows filename (fail fast, before any
+    fetching starts)."""
+    stem = os.path.splitext(os.path.basename(s.strip()))[0]
+    if not stem:
+        raise argparse.ArgumentTypeError("name must not be empty")
+    bad = set('<>:"/\\|?*') & set(stem)
+    if bad:
+        raise argparse.ArgumentTypeError(
+            f"name has illegal character(s): {''.join(sorted(bad))}")
+    return stem
+
+
+def parse_args():
+    """Optional positional override for the module-level MAX_MARKETS cap, e.g.
+    `python fetch_polymarket.py 50`. Omitting it uses the file default; passing
+    'all' (or 0) forces a full pull. `--name` sets a custom output base name."""
+    p = argparse.ArgumentParser(
+        description="Fetch resolved binary Polymarket markets to Data/<name>.csv.")
+    p.add_argument(
+        "max_markets", nargs="?", type=_max_markets_arg, default=MAX_MARKETS,
+        help=f"Cap on kept binary markets (default from file: {MAX_MARKETS}). "
+             "Pass an integer like 50, or 'all' for the full history.")
+    p.add_argument(
+        "-o", "--name", type=_name_arg, default=None,
+        help="Output base filename (no extension), written to Data/ as "
+             "<name>.csv and numbered if it already exists. Default: polymarket.")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    MAX_MARKETS = args.max_markets  # CLI overrides the file default
+    main(args.name)
