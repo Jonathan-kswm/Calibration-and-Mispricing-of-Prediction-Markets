@@ -71,9 +71,52 @@ class Report:
                 results.append(dataframe['result'][idx])
             else:
                 continue
-        return len(markets), sum(results), (sum(results) / len(markets))
 
-    def report_table(self,metric , step, margin = 0.05):
+        try:
+            frequency = sum(results) / len(markets)
+        except ZeroDivisionError:
+            frequency = np.nan  # no markets in this price bucket -> undefined
+
+        return len(markets), sum(results), frequency
+
+    def report_table(self, metric = "count", step = 0.1, margin = 0.05):
         #check that the metric is ok
-        valid_metrics = ("count", "")
+        valid_metrics = ("count", "resolution", "freq")
+        if metric not in valid_metrics:
+            raise ValueError("metric not in valid metrics")
+        else:
+            pass
 
+        table = {
+            "Price": list(),
+            "six_month": list(),
+            "three_month": list(),
+            "one_month": list(),
+            "one_week": list(),
+            "one_day": list()
+        }
+
+        #create the prices based on the step and the margin
+        price_list = []
+        index = 0
+        while index <= 1:
+            price_list.append(np.round(index, decimals = 3))
+            index += step
+
+        table["Price"] = price_list
+
+        market_keys = list(table.keys())
+        market_keys.remove("Price")
+        for market in market_keys:
+            market_list = []
+            for price in price_list:
+                if metric == "count":
+                    market_list.append(self.freq_report(market, price, margin)[0])
+                elif metric == "resolution":
+                    market_list.append(self.freq_report(market, price, margin)[1])
+                else:
+                    market_list.append(self.freq_report(market, price, margin)[2])
+
+            table[market] = market_list
+
+        return pd.DataFrame(table)
