@@ -104,9 +104,18 @@ def get_json(url, params):
             time.sleep(wait)
             backoff *= 2
             continue
-        # Any other 4xx/5xx raises immediately: a client error like Gamma's 422
-        # for an out-of-range offset won't change on retry, so fail fast instead
-        # of looping MAX_RETRIES times and then crashing.
+        if resp.status_code >= 500:
+            # Transient server error (Gamma throws occasional 500s) -> retry with
+            # backoff. One of these mid-enumeration would otherwise kill a
+            # multi-hour pull.
+            if attempt == MAX_RETRIES - 1:
+                resp.raise_for_status()
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+        # Any other 4xx raises immediately: a client error like Gamma's 422 for
+        # an out-of-range offset won't change on retry, so fail fast instead of
+        # looping MAX_RETRIES times and then crashing.
         resp.raise_for_status()
         time.sleep(REQUEST_SLEEP)
         return resp.json()
@@ -206,7 +215,7 @@ def parse_ts(value):
 # --------------------------------------------------------------------------- #
 # Gamma rejects offset beyond ~2000 with HTTP 422, so plain offset pagination
 # can only reach the newest ~2000 markets. We page with offset only up to this
-# cap, then slide a date window (end_date_max) back to continue (keyset pagination).
+# cap, then slide a date window (start_date_max) back to continue (keyset pagination).
 OFFSET_CAP = 2000
 
 
@@ -240,43 +249,51 @@ def _emit_market(m, stats):
 
 def iter_resolved_markets(stats):
     """Yield binary Yes/No markets one at a time across the *entire* closed-market
-    history, newest endDate first. Updates stats['scanned'] / stats['kept'].
+    history, newest startDate first. Updates stats['scanned'] / stats['kept'].
 
     Because Gamma caps offset at ~2000, we use keyset pagination: page by offset
     within a date window, and when we approach the offset cap slide the window's
-    upper bound (end_date_max) back to the oldest endDate seen so far, then keep
-    going. Markets are de-duplicated by id, since window boundaries overlap.
+    upper bound (start_date_max) back to the oldest startDate seen so far, then
+    keep going. Markets are de-duplicated by id, since window boundaries overlap.
+
+    The window key MUST be startDate, not endDate: startDates carry sub-second
+    precision and are effectively unique, so the window always advances. Recurring
+    hourly/daily markets share one exact endDate in clusters deeper than the
+    offset cap, so an endDate window could never page past them — that stalled
+    full pulls at ~10 months of history.
     """
     seen = set()
-    window_max = None  # end_date_max bound; None => start at the newest markets
+    window_max = None  # start_date_max bound; None => start at the newest markets
     while True:
         offset = 0
-        oldest_end = None
+        oldest_start = None
         new_this_window = 0
         while True:
             params = {
                 "closed": "true",
-                "order": "endDate",
+                "order": "startDate",
                 "ascending": "false",
                 "limit": PAGE_LIMIT,
                 "offset": offset,
             }
             if window_max is not None:
-                params["end_date_max"] = window_max
+                params["start_date_max"] = window_max
             page = get_json(GAMMA_URL, params)
             if not isinstance(page, list) or not page:
                 break  # window exhausted
             for m in page:
-                # endDate descending => the last item seen is the oldest so far.
-                if m.get("endDate"):
-                    oldest_end = m["endDate"]
+                # startDate descending => the last item seen is the oldest so far.
+                if m.get("startDate"):
+                    oldest_start = m["startDate"]
                 mid = m.get("id")
                 if mid in seen:
                     continue  # overlap from a previous window
                 seen.add(mid)
+                # Count every new market, not just kept binary ones: a window of
+                # new-but-non-binary markets is progress, not the end of history.
+                new_this_window += 1
                 row = _emit_market(m, stats)
                 if row is not None:
-                    new_this_window += 1
                     yield row
                     if MAX_MARKETS is not None and stats["kept"] >= MAX_MARKETS:
                         return
@@ -284,12 +301,11 @@ def iter_resolved_markets(stats):
             if offset >= OFFSET_CAP:
                 break  # approaching the offset cap => slide the window instead
         tqdm.write(f"  ...scanned {stats['scanned']} markets, kept {stats['kept']} "
-                   f"binary (window end_date_max={window_max})")
-        # Stop when a whole window produced nothing new (end of history, or all
-        # remaining markets share one endDate boundary we can't page past).
-        if oldest_end is None or new_this_window == 0:
+                   f"binary (window start_date_max={window_max})")
+        # Stop when a whole window produced nothing new: end of history.
+        if oldest_start is None or new_this_window == 0:
             break
-        window_max = oldest_end  # slide the window back; overlap deduped via `seen`
+        window_max = oldest_start  # slide the window back; overlap deduped via `seen`
 
 
 # --------------------------------------------------------------------------- #
