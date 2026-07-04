@@ -1,5 +1,0 @@
-Here are the requirements to run the model:
-
-requests>=2.34
-pandas>=3.0
-web3>=7.16
