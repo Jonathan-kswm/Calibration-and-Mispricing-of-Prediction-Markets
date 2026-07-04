@@ -53,7 +53,10 @@ CTF_ABI = [
 
 MAX_MARKETS = 1000      # cap kept binary markets for a test run; set None for full pull
 FLUSH_EVERY = 25      # checkpoint the CSV to disk every N processed markets
-DERIVE_NO = True      # if True, fetch only the Yes token and set No = 1 - Yes
+DERIVE_NO = False     # if True, fetch only the Yes token and set No = 1 - Yes.
+                      # Keep False here: this repo studies fee-driven mispricing,
+                      # i.e. exactly the Yes+No != 1 deviations that deriving
+                      # No from Yes would erase.
 WORKERS = 6           # parallel per-market workers; total CLOB rate ~= WORKERS /
                       # (REQUEST_SLEEP + latency). Back off if 429s dominate.
 PAGE_LIMIT = 500      # requested page size; Gamma usually caps pages at ~100
