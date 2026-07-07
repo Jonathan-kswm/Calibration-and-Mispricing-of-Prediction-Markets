@@ -20,7 +20,11 @@ class Report:
 
     # I am going to need a general case function that creates a new dataframe given a condition
     def split_df_one_condition(self, condition):
-        #use dataframe_checks
+
+        '''
+        This has a big issue currently, that it is called constantly creating a new dataframe each time
+        '''
+        #use dataframe checks
         self.dataframe_checks()
 
         options = {

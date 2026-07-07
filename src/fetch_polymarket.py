@@ -57,7 +57,7 @@ DERIVE_NO = False     # if True, fetch only the Yes token and set No = 1 - Yes.
                       # Keep False here: this repo studies fee-driven mispricing,
                       # i.e. exactly the Yes+No != 1 deviations that deriving
                       # No from Yes would erase.
-WORKERS = 6           # parallel per-market workers; total CLOB rate ~= WORKERS /
+WORKERS = 10           # parallel per-market workers; total CLOB rate ~= WORKERS /
                       # (REQUEST_SLEEP + latency). Back off if 429s dominate.
 PAGE_LIMIT = 500      # requested page size; Gamma usually caps pages at ~100
                       # (offset advances by rows returned, so this only affects
